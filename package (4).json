@@ -1,0 +1,148 @@
+import { Router, type IRouter } from "express";
+import { GoogleGenAI, Modality } from "@google/genai";
+
+const router: IRouter = Router();
+
+// Supports both Replit AI Integration proxy and a plain Google Gemini API key.
+// Set GEMINI_API_KEY when self-hosting (Render, Railway, Fly.io, local, etc.)
+const directKey = process.env["GEMINI_API_KEY"];
+const proxyKey = process.env["AI_INTEGRATIONS_GEMINI_API_KEY"];
+const proxyBaseUrl = process.env["AI_INTEGRATIONS_GEMINI_BASE_URL"];
+
+let ai: GoogleGenAI;
+if (directKey) {
+  ai = new GoogleGenAI({ apiKey: directKey });
+} else if (proxyKey && proxyBaseUrl) {
+  ai = new GoogleGenAI({
+    apiKey: proxyKey,
+    httpOptions: { apiVersion: "", baseUrl: proxyBaseUrl },
+  });
+} else {
+  throw new Error(
+    "Gemini API key missing. Set GEMINI_API_KEY (recommended for self-hosting) " +
+      "or AI_INTEGRATIONS_GEMINI_API_KEY + AI_INTEGRATIONS_GEMINI_BASE_URL (Replit).",
+  );
+}
+
+const FORBIDDEN = [
+  "اباحي","إباحي","سكس","عاري","عارية","ممارسة جنسية","نيك","قضيب","مهبل",
+  "شرموطة","عاهرة","فاحشة","فحش","مشهد جنسي",
+  "porn","pornography","sex scene","explicit sex","nude","nudity","xxx","fuck",
+  "penis","vagina","whore","slut","masturbat",
+];
+
+function moderate(text: string): { ok: boolean; reason?: string } {
+  if (!text) return { ok: true };
+  const lower = text.toLowerCase();
+  const hit = FORBIDDEN.find((w) => lower.includes(w.toLowerCase()));
+  if (hit) {
+    return {
+      ok: false,
+      reason: `🚫 رصد المشرف الذكي محتوى مخالف ("${hit}"). لا يُسمح بالمحتوى الإباحي.`,
+    };
+  }
+  return { ok: true };
+}
+
+router.post("/moderate", (req, res) => {
+  const text = String(req.body?.text || "");
+  res.json(moderate(text));
+});
+
+router.post("/generate-chapter", async (req, res) => {
+  try {
+    const outline = String(req.body?.outline || "").slice(0, 4000);
+    const title = String(req.body?.title || "").slice(0, 200);
+    const targetWords = Math.min(Math.max(Number(req.body?.targetWords) || 2000, 200), 4000);
+
+    const mod = moderate(outline + " " + title);
+    if (!mod.ok) return res.status(400).json({ error: mod.reason });
+
+    const prompt = `أنت كاتب روائي عربي محترف. اكتب فصلاً كاملاً من رواية باللغة العربية الفصحى، بأسلوب أدبي راقٍ ومشوّق.
+
+عنوان الفصل: ${title || "بدون عنوان"}
+مخطط الفصل / الأفكار الرئيسية:
+${outline || "(لا يوجد مخطط محدد — اكتب فصلاً افتتاحياً مشوقاً)"}
+
+تعليمات صارمة:
+- اكتب نصاً سردياً متماسكاً يقارب ${targetWords} كلمة (مهم جداً ألا يقل عن ${Math.floor(targetWords * 0.85)} كلمة).
+- استخدم فقرات منفصلة بسطر فارغ بينها.
+- تجنّب أي محتوى إباحي أو فاحش أو مسيء.
+- لا تكتب مقدمة أو تعليقاً، ابدأ مباشرة بنص الفصل.
+- لا تستخدم تنسيق Markdown (لا عناوين، لا قوائم، لا نجوم).`;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      config: { maxOutputTokens: 8192, temperature: 0.9 },
+    });
+    const text = (response.text || "").trim();
+
+    const modOut = moderate(text);
+    if (!modOut.ok) return res.status(400).json({ error: modOut.reason });
+
+    res.json({ text });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "AI error";
+    res.status(500).json({ error: msg });
+  }
+});
+
+router.post("/generate-image", async (req, res) => {
+  try {
+    const prompt = String(req.body?.prompt || "").slice(0, 1000);
+    if (!prompt) return res.status(400).json({ error: "اكتب وصفاً للصورة" });
+    const mod = moderate(prompt);
+    if (!mod.ok) return res.status(400).json({ error: mod.reason });
+
+    const enriched = `Book cover illustration in elegant, artistic style. Subject: ${prompt}. High quality, vivid colors, no text overlay, no nudity.`;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash-image",
+      contents: [{ role: "user", parts: [{ text: enriched }] }],
+      config: { responseModalities: [Modality.IMAGE] },
+    });
+
+    const parts = response.candidates?.[0]?.content?.parts || [];
+    for (const p of parts) {
+      const data = p.inlineData?.data;
+      const mime = p.inlineData?.mimeType || "image/png";
+      if (data) {
+        return res.json({ dataUrl: `data:${mime};base64,${data}` });
+      }
+    }
+    res.status(500).json({ error: "لم يتم توليد صورة" });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "AI error";
+    res.status(500).json({ error: msg });
+  }
+});
+
+router.post("/generate-ideas", async (req, res) => {
+  try {
+    const title = String(req.body?.title || "").slice(0, 200);
+    const summary = String(req.body?.summary || "").slice(0, 1000);
+    const category = String(req.body?.category || "").slice(0, 100);
+
+    const prompt = `أنت مساعد كتابة روائي. اقترح ٤ أفكار قصيرة ومتنوعة لأحداث الفصل القادم في رواية عربية.
+العنوان: ${title}
+التصنيف: ${category}
+الملخص: ${summary}
+
+أعد الإجابة كأربع جمل فقط، كل فكرة في سطر منفصل، بدون ترقيم ولا رموز.`;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      config: { maxOutputTokens: 1024, temperature: 0.95 },
+    });
+    const text = (response.text || "").trim();
+    const ideas = text.split("\n").map((s) => s.replace(/^[\d\-\.\*\u0660-\u0669\s]+/, "").trim()).filter(Boolean).slice(0, 4);
+    res.json({ ideas });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "AI error";
+    res.status(500).json({ error: msg });
+  }
+});
+
+export default router;
